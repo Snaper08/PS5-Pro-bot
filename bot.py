@@ -12,7 +12,6 @@ STATE_FILE = Path("state.json")
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Start med få butikker. Tilføj flere efter test.
 STORES = [
     {
         "name": "Elgiganten",
@@ -33,7 +32,10 @@ STORES = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; PersonalStockMonitor/1.0)"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+    )
 }
 
 session = requests.Session()
@@ -51,7 +53,12 @@ def telegram(message):
 
 def load_state():
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
     return {}
 
 
@@ -63,7 +70,6 @@ def save_state(state):
 
 
 def walk_json(obj):
-    """Gå rekursivt gennem JSON-LD-data."""
     if isinstance(obj, dict):
         yield obj
         for value in obj.values():
@@ -73,12 +79,36 @@ def walk_json(obj):
             yield from walk_json(value)
 
 
-def product_data(soup):
-    """Find struktureret pris og lagerstatus, hvis siden tilbyder dem."""
-    price = None
-    availability = None
+def parse_price(raw_price):
+    if raw_price is None:
+        return None
 
-    # Først: produktets JSON-LD-data.
+    value = str(raw_price).strip()
+    value = re.sub(r"[^0-9,.]", "", value)
+
+    if not value:
+        return None
+
+    # Håndter danske priser som 7.499,00.
+    if "," in value and "." in value:
+        if value.rfind(",") > value.rfind("."):
+            value = value.replace(".", "").replace(",", ".")
+        else:
+            value = value.replace(",", "")
+    elif "," in value:
+        value = value.replace(",", ".")
+
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def product_data(soup):
+    """Returnér pris og eksplicit struktureret lagerstatus."""
+    prices = []
+    availabilities = []
+
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             data = json.loads(script.string or script.get_text())
@@ -86,60 +116,82 @@ def product_data(soup):
             continue
 
         for item in walk_json(data):
-            if item.get("@type") == "Product":
-                offers = item.get("offers", [])
-                if isinstance(offers, dict):
-                    offers = [offers]
+            types = item.get("@type", [])
+            if isinstance(types, str):
+                types = [types]
 
-                for offer in offers:
-                    if not isinstance(offer, dict):
-                        continue
+            if "Product" not in types:
+                continue
 
-                    currency = offer.get("priceCurrency")
-                    raw_price = offer.get("price")
+            offers = item.get("offers", [])
+            if isinstance(offers, dict):
+                offers = [offers]
 
-                    if raw_price is None:
-                        spec = offer.get("priceSpecification", {})
+            for offer in offers:
+                if not isinstance(offer, dict):
+                    continue
+
+                currency = offer.get("priceCurrency")
+                raw_price = offer.get("price")
+
+                if raw_price is None:
+                    spec = offer.get("priceSpecification", {})
+                    if isinstance(spec, dict):
                         raw_price = spec.get("price")
                         currency = spec.get("priceCurrency", currency)
 
-                    if raw_price is not None and currency == "DKK":
-                        try:
-                            price = float(str(raw_price).replace(",", "."))
-                        except ValueError:
-                            pass
+                parsed = parse_price(raw_price)
+                if parsed is not None and currency == "DKK":
+                    prices.append(parsed)
 
-                    if offer.get("availability"):
-                        availability = str(offer["availability"]).lower()
+                availability = offer.get("availability")
+                if availability:
+                    availability = str(availability).lower()
+                    availabilities.append(availability)
 
-                    if price is not None and availability:
-                        return price, availability
-
-    # Alternativ: almindelige pris-meta-tags.
+    # Meta-tags kan give en pris, men ikke i sig selv bevise lager.
     for selector in [
         'meta[property="product:price:amount"]',
         'meta[itemprop="price"]',
     ]:
         tag = soup.select_one(selector)
-        if tag:
-            currency_tag = soup.select_one(
-                'meta[property="product:price:currency"]'
-            )
-            currency = currency_tag.get("content") if currency_tag else None
+        if not tag:
+            continue
 
-            if currency == "DKK" or tag.get("itemprop") == "price":
-                try:
-                    price = float(tag.get("content", "").replace(",", "."))
-                except ValueError:
-                    pass
-                if price is not None:
-                    break
+        currency_tag = soup.select_one(
+            'meta[property="product:price:currency"]'
+        )
+        currency = currency_tag.get("content") if currency_tag else None
 
-    # Meta-tags fortæller ikke nødvendigvis lagerstatus.
-    for tag in soup.select('link[itemprop="availability"]'):
-        availability = str(tag.get("href", "")).lower()
-        if availability:
-            break
+        if currency == "DKK" or tag.get("itemprop") == "price":
+            parsed = parse_price(tag.get("content"))
+            if parsed is not None:
+                prices.append(parsed)
+                break
+
+    # Brug den laveste fundne pris, hvis flere prisfelter findes.
+    price = min(prices) if prices else None
+
+    # Struktureret lagerstatus er eneste positive lagerbevis.
+    # Hvis tilbuddene er modstridende, vælger vi den forsigtige status.
+    availability = None
+
+    if availabilities:
+        if any(
+            "outofstock" in value
+            or "soldout" in value
+            or "discontinued" in value
+            for value in availabilities
+        ):
+            availability = "OUT"
+        elif all(
+            "instock" in value
+            or "limitedavailability" in value
+            for value in availabilities
+        ):
+            availability = "IN"
+        else:
+            availability = "UNKNOWN"
 
     return price, availability
 
@@ -152,30 +204,39 @@ def check_store(store):
         soup = BeautifulSoup(response.text, "html.parser")
         price, availability = product_data(soup)
 
-        # Struktureret lagerstatus er bedst, når den findes.
-        if availability:
-            if "outofstock" in availability or "soldout" in availability:
-                return "OUT", price
-            if "instock" in availability or "limitedavailability" in availability:
-                status = "IN"
-            else:
-                status = "UNKNOWN"
-        else:
-            # Forsigtig fallback. Webshoppen kan kræve en specialtilpasning.
-            text = soup.get_text(" ", strip=True).lower()
+        # Tydelige tegn på manglende tilgængelighed har forrang.
+        # Fjern scripts/styles, så skjult kode ikke tæller som tekst.
+        for element in soup(["script", "style", "noscript"]):
+            element.decompose()
 
-            if any(word in text for word in [
-                "udsolgt", "ikke på lager", "midlertidigt udsolgt"
-            ]):
-                status = "OUT"
-            elif any(word in text for word in [
-                "på lager", "læg i kurv", "tilføj til kurv"
-            ]):
-                status = "POSSIBLE"
-            else:
-                status = "UNKNOWN"
+        text = soup.get_text(" ", strip=True).lower()
+        text = re.sub(r"\s+", " ", text)
 
-        return status, price
+        unavailable_phrases = [
+            "udsolgt",
+            "ikke på lager",
+            "ikke tilgængelig",
+            "ikke tilgaengelig",
+            "midlertidigt udsolgt",
+            "kan ikke bestilles",
+            "not available",
+            "out of stock",
+            "sold out",
+        ]
+
+        if any(phrase in text for phrase in unavailable_phrases):
+            return "OUT", price
+
+        # IN kræver eksplicit struktureret lagerstatus.
+        # "Læg i kurv", en pris eller en almindelig produktside er
+        # IKKE tilstrækkeligt bevis.
+        if availability == "IN":
+            return "IN", price
+
+        if availability == "OUT":
+            return "OUT", price
+
+        return "UNKNOWN", price
 
     except requests.RequestException as error:
         print(f"FEJL: {store['name']}: {error}")
@@ -188,29 +249,45 @@ def main():
     for store in STORES:
         name = store["name"]
         status, price = check_store(store)
-        old_status = state.get(name)
 
-        print(f"{name}: status={status}, pris={price}")
+        # Understøtter både gamle state.json-værdier og nye.
+        old_entry = state.get(name, {})
+        if isinstance(old_entry, dict):
+            old_status = old_entry.get("status")
+        else:
+            old_status = old_entry
 
-        # Kræv en kendt pris under grænsen.
         price_ok = price is not None and 0 < price <= MAX_PRICE_DKK
 
-        # En fallback-status giver kun en forsigtig advarsel.
-        if status in ("IN", "POSSIBLE") and price_ok:
+        print(
+            f"{name}: status={status}, pris={price}, "
+            f"tidligere_status={old_status}"
+        )
+
+        if status == "IN" and price_ok:
             if old_status != "IN":
                 telegram(
-                    f"PS5 PRO: MULIGT LAGERFUND\n"
+                    f"PS5 PRO: LAGERSTATUS ANGIVET SOM TILGÆNGELIG\n"
                     f"Butik: {name}\n"
                     f"Pris: {price:.2f} kr.\n"
-                    f"Status: {status}\n"
-                    f"Tjek straks, om den kan bestilles:\n{store['url']}"
+                    f"Kontrollér, at varen kan bestilles:\n{store['url']}"
                 )
-            state[name] = "IN"
+
+            state[name] = {
+                "status": "IN",
+                "price": price,
+            }
 
         elif status == "OUT":
-            state[name] = "OUT"
+            state[name] = {
+                "status": "OUT",
+                "price": price,
+            }
 
-        # UNKNOWN/ERROR overskriver ikke den sidste kendte status.
+        else:
+            # UNKNOWN/ERROR overskriver ikke seneste kendte status.
+            # Det forhindrer usikre fund i at blive gemt som IN.
+            print(f"{name}: Ingen sikker lagerstatus; ingen alarm.")
 
     save_state(state)
 
