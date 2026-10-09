@@ -196,18 +196,21 @@ def product_data(soup):
     return price, availability
 
 
+
 def check_store(store):
+    # Norlys sættes midlertidigt på pause, indtil deres
+    # faktiske bestillingsstatus kan kontrolleres pålideligt.
+    if store["name"] == "Norlys":
+        print("Norlys: PAUSE - ingen lageralarm sendes.")
+        return "UNKNOWN", None
+
     try:
         response = session.get(store["url"], timeout=25)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
         price, availability = product_data(soup)
-         if store["name"] == "Norlys":
-         print("Norlys: Lagerstatus kræver særskilt kontrol.")
-         return "UNKNOWN", price
-        # Tydelige tegn på manglende tilgængelighed har forrang.
-        # Fjern scripts/styles, så skjult kode ikke tæller som tekst.
+
         for element in soup(["script", "style", "noscript"]):
             element.decompose()
 
@@ -221,7 +224,6 @@ def check_store(store):
             "ikke tilgaengelig",
             "midlertidigt udsolgt",
             "kan ikke bestilles",
-            "not available",
             "out of stock",
             "sold out",
         ]
@@ -229,14 +231,11 @@ def check_store(store):
         if any(phrase in text for phrase in unavailable_phrases):
             return "OUT", price
 
-        # IN kræver eksplicit struktureret lagerstatus.
-        # "Læg i kurv", en pris eller en almindelig produktside er
-        # IKKE tilstrækkeligt bevis.
-        if availability == "IN":
-            return "IN", price
-
         if availability == "OUT":
             return "OUT", price
+
+        if availability == "IN":
+            return "IN", price
 
         return "UNKNOWN", price
 
