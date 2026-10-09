@@ -3,8 +3,8 @@ import os
 import json
 import re
 import requests
-from bs4 import BeautifulSoup
 from pathlib import Path
+from bs4 import BeautifulSoup
 
 MAX_PRICE_DKK = 8000
 STATE_FILE = Path("state.json")
@@ -12,6 +12,7 @@ STATE_FILE = Path("state.json")
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
+# Norlys er helt fjernet.
 STORES = [
     {
         "name": "Elgiganten",
@@ -25,16 +26,13 @@ STORES = [
         "name": "Proshop",
         "url": "https://www.proshop.dk/Sony-PlayStation-5-Pro",
     },
-    {
-        "name": "Norlys",
-        "url": "https://shop.norlys.dk/shop/accessories/sony-playstation-5-pro-4b3d628f/",
-    },
 ]
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
     )
 }
 
@@ -45,21 +43,26 @@ session.headers.update(HEADERS)
 def telegram(message):
     response = session.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": message},
+        json={
+            "chat_id": CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": True,
+        },
         timeout=20,
     )
     response.raise_for_status()
 
 
 def load_state():
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    if not STATE_FILE.exists():
+        return {}
+
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        print("ADVARSEL: state.json kunne ikke læses. Starter med tom status.")
+        return {}
 
 
 def save_state(state):
@@ -89,7 +92,7 @@ def parse_price(raw_price):
     if not value:
         return None
 
-    # Håndter danske priser som 7.499,00.
+    # Eksempel: 7.499,00 bliver til 7499.00.
     if "," in value and "." in value:
         if value.rfind(",") > value.rfind("."):
             value = value.replace(".", "").replace(",", ".")
@@ -104,10 +107,29 @@ def parse_price(raw_price):
         return None
 
 
+def is_ps5_pro_product(item):
+    name = item.get("name", "")
+    if not isinstance(name, str):
+        return False
+
+    normalized = re.sub(r"[^a-z0-9]+", " ", name.lower())
+    has_console_name = (
+        "playstation 5" in normalized
+        or re.search(r"\bps5\b", normalized) is not None
+    )
+    has_pro = re.search(r"\bpro\b", normalized) is not None
+
+    return has_console_name and has_pro
+
+
 def product_data(soup):
-    """Returnér pris og eksplicit struktureret lagerstatus."""
-    prices = []
-    availabilities = []
+    """
+    Finder pris og lagerstatus for PS5 Pro-produktet.
+
+    En pris eller teksten 'læg i kurv' er ikke bevis på lager.
+    Positiv lagerstatus kræver eksplicit strukturerede produktdata.
+    """
+    matching_products = []
 
     for script in soup.select('script[type="application/ld+json"]'):
         try:
@@ -116,132 +138,109 @@ def product_data(soup):
             continue
 
         for item in walk_json(data):
-            types = item.get("@type", [])
-            if isinstance(types, str):
-                types = [types]
+            item_types = item.get("@type", [])
+            if isinstance(item_types, str):
+                item_types = [item_types]
 
-            if "Product" not in types:
+            if not any(
+                product_type in ("Product", "ProductGroup")
+                for product_type in item_types
+            ):
                 continue
 
-            offers = item.get("offers", [])
-            if isinstance(offers, dict):
-                offers = [offers]
+            if is_ps5_pro_product(item):
+                matching_products.append(item)
 
-            for offer in offers:
-                if not isinstance(offer, dict):
-                    continue
+    prices = []
+    availabilities = []
 
-                currency = offer.get("priceCurrency")
-                raw_price = offer.get("price")
+    for product in matching_products:
+        offers = product.get("offers", [])
 
-                if raw_price is None:
-                    spec = offer.get("priceSpecification", {})
-                    if isinstance(spec, dict):
-                        raw_price = spec.get("price")
-                        currency = spec.get("priceCurrency", currency)
+        if isinstance(offers, dict):
+            offers = [offers]
 
-                parsed = parse_price(raw_price)
-                if parsed is not None and currency == "DKK":
-                    prices.append(parsed)
+        for offer in offers:
+            if not isinstance(offer, dict):
+                continue
 
-                availability = offer.get("availability")
-                if availability:
-                    availability = str(availability).lower()
-                    availabilities.append(availability)
+            currency = offer.get("priceCurrency")
+            raw_price = offer.get("price")
 
-    # Meta-tags kan give en pris, men ikke i sig selv bevise lager.
-    for selector in [
-        'meta[property="product:price:amount"]',
-        'meta[itemprop="price"]',
-    ]:
-        tag = soup.select_one(selector)
-        if not tag:
-            continue
+            if raw_price is None:
+                spec = offer.get("priceSpecification", {})
+                if isinstance(spec, dict):
+                    raw_price = spec.get("price")
+                    currency = spec.get("priceCurrency", currency)
 
-        currency_tag = soup.select_one(
-            'meta[property="product:price:currency"]'
-        )
-        currency = currency_tag.get("content") if currency_tag else None
+            if currency == "DKK":
+                price = parse_price(raw_price)
+                if price is not None and price > 0:
+                    prices.append(price)
 
-        if currency == "DKK" or tag.get("itemprop") == "price":
-            parsed = parse_price(tag.get("content"))
-            if parsed is not None:
-                prices.append(parsed)
-                break
+            availability = offer.get("availability")
+            if availability:
+                availabilities.append(str(availability).lower())
 
-    # Brug den laveste fundne pris, hvis flere prisfelter findes.
     price = min(prices) if prices else None
 
-    # Struktureret lagerstatus er eneste positive lagerbevis.
-    # Hvis tilbuddene er modstridende, vælger vi den forsigtige status.
-    availability = None
+    if not availabilities:
+        return price, "UNKNOWN"
 
-    if availabilities:
-        if any(
-            "outofstock" in value
-            or "soldout" in value
-            or "discontinued" in value
-            for value in availabilities
-        ):
-            availability = "OUT"
-        elif all(
-            "instock" in value
-            or "limitedavailability" in value
-            for value in availabilities
-        ):
-            availability = "IN"
-        else:
-            availability = "UNKNOWN"
+    # Ved modstridende data vælger vi den forsigtige status.
+    out_markers = (
+        "outofstock",
+        "soldout",
+        "discontinued",
+    )
+    in_markers = (
+        "instock",
+        "limitedavailability",
+    )
 
-    return price, availability
+    if any(
+        any(marker in value for marker in out_markers)
+        for value in availabilities
+    ):
+        return price, "OUT"
 
+    if all(
+        any(marker in value for marker in in_markers)
+        for value in availabilities
+    ):
+        return price, "IN"
+
+    return price, "UNKNOWN"
 
 
 def check_store(store):
-    # Norlys sættes midlertidigt på pause, indtil deres
-    # faktiske bestillingsstatus kan kontrolleres pålideligt.
-    if store["name"] == "Norlys":
-        print("Norlys: PAUSE - ingen lageralarm sendes.")
-        return "UNKNOWN", None
-
     try:
         response = session.get(store["url"], timeout=25)
         response.raise_for_status()
 
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "html" not in content_type:
+            print(f"{store['name']}: UNKNOWN - svaret er ikke HTML.")
+            return "UNKNOWN", None
+
         soup = BeautifulSoup(response.text, "html.parser")
-        price, availability = product_data(soup)
+        price, status = product_data(soup)
 
-        for element in soup(["script", "style", "noscript"]):
-            element.decompose()
-
-        text = soup.get_text(" ", strip=True).lower()
-        text = re.sub(r"\s+", " ", text)
-
-        unavailable_phrases = [
-            "udsolgt",
-            "ikke på lager",
-            "ikke tilgængelig",
-            "ikke tilgaengelig",
-            "midlertidigt udsolgt",
-            "kan ikke bestilles",
-            "out of stock",
-            "sold out",
-        ]
-
-        if any(phrase in text for phrase in unavailable_phrases):
-            return "OUT", price
-
-        if availability == "OUT":
-            return "OUT", price
-
-        if availability == "IN":
-            return "IN", price
-
-        return "UNKNOWN", price
+        # Ingen fallback baseret på pris, "læg i kurv" eller
+        # generelle lagerord på siden.
+        # Ukendte data skal aldrig skabe en lageralarm.
+        return status, price
 
     except requests.RequestException as error:
         print(f"FEJL: {store['name']}: {error}")
         return "ERROR", None
+
+
+def previous_status(entry):
+    # Understøtter både den gamle og den nye state.json-struktur.
+    if isinstance(entry, dict):
+        return entry.get("status")
+    return entry
 
 
 def main():
@@ -250,45 +249,46 @@ def main():
     for store in STORES:
         name = store["name"]
         status, price = check_store(store)
+        old_status = previous_status(state.get(name))
 
-        # Understøtter både gamle state.json-værdier og nye.
-        old_entry = state.get(name, {})
-        if isinstance(old_entry, dict):
-            old_status = old_entry.get("status")
-        else:
-            old_status = old_entry
-
-        price_ok = price is not None and 0 < price <= MAX_PRICE_DKK
+        price_ok = (
+            price is not None
+            and 0 < price <= MAX_PRICE_DKK
+        )
 
         print(
             f"{name}: status={status}, pris={price}, "
             f"tidligere_status={old_status}"
         )
 
+        if status == "OUT":
+            state[name] = {
+                "status": "OUT",
+                "price": price,
+            }
+            continue
+
         if status == "IN" and price_ok:
             if old_status != "IN":
                 telegram(
-                    f"PS5 PRO: LAGERSTATUS ANGIVET SOM TILGÆNGELIG\n"
+                    "PS5 PRO: PRODUKTDATA ANGIVER LAGER\n"
                     f"Butik: {name}\n"
                     f"Pris: {price:.2f} kr.\n"
-                    f"Kontrollér, at varen kan bestilles:\n{store['url']}"
+                    "Kontrollér, at varen faktisk kan bestilles:\n"
+                    f"{store['url']}"
                 )
 
             state[name] = {
                 "status": "IN",
                 "price": price,
             }
+            continue
 
-        elif status == "OUT":
-            state[name] = {
-                "status": "OUT",
-                "price": price,
-            }
+        # UNKNOWN/ERROR overskriver ikke den sidste kendte status.
+        print(f"{name}: Ingen sikker lageralarm.")
 
-        else:
-            # UNKNOWN/ERROR overskriver ikke seneste kendte status.
-            # Det forhindrer usikre fund i at blive gemt som IN.
-            print(f"{name}: Ingen sikker lagerstatus; ingen alarm.")
+    # Fjern eventuelle gamle Norlys-data fra state.json.
+    state.pop("Norlys", None)
 
     save_state(state)
 
