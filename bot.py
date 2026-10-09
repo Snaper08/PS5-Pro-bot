@@ -203,7 +203,9 @@ def check_store(store):
 
         soup = BeautifulSoup(response.text, "html.parser")
         price, availability = product_data(soup)
-
+         if store["name"] == "Norlys":
+         print("Norlys: Lagerstatus kræver særskilt kontrol.")
+         return "UNKNOWN", price
         # Tydelige tegn på manglende tilgængelighed har forrang.
         # Fjern scripts/styles, så skjult kode ikke tæller som tekst.
         for element in soup(["script", "style", "noscript"]):
