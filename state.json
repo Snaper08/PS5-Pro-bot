@@ -1,3 +1,6 @@
 {
-  "Norlys": "IN"
+  "POWER": {
+    "status": "OUT",
+    "price": 6390.0
+  }
 }
